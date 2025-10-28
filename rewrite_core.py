@@ -1,27 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-rewrite_core.py
-نواة المنطق: قفل الأرقام الحساسة (أسعار/نسب) + توحيد العلامة العشرية + استدعاء OpenAI
-يتجاهل التواريخ أو الأرقام غير المالية.
-يدعم fallback تلقائي عند عدم دعم temperature.
+rewrite_core.py — نسخة مبسطة بدون تحقق رقمي
+تُعيد الصياغة فقط باستخدام OpenAI وتحافظ على الهيكل الصحفي للسيو.
 """
 
-import re
-from decimal import Decimal, InvalidOperation
-from typing import List, Tuple
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
-
-# ----------------- إعداد التعبيرات والسياقات -----------------
-
-NUM_REGEX = re.compile(
-    r'(?<![\w.\-])(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?(?![\w.\-])',
-    re.UNICODE
-)
-
-CURRENCY_HINTS = [
-    "جنيه", "EGP", "ج.م", "USD", "دولار", "ريال", "SAR", "EUR", "يورو",
-    "شراء", "بيع", "%"
-]
 
 SYSTEM_PROMPT = """أنت محرر اقتصادي محترف متخصص في الصياغة الصحفية الموجهة للجمهور العام.
 مهمتك إعادة كتابة المقال بلغة عربية مبسّطة وواضحة دون أي حشو أو تحليل، مع الحفاظ الكامل على جميع الأرقام والتواريخ والأسماء كما هي في النص الأصلي.
@@ -70,154 +53,49 @@ USER_PROMPT_TEMPLATE = """هذا هو النص الأصلي الذي أريد إ
 {original_text}
 """
 
-# ----------------- أدوات الأرقام -----------------
-
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-
-def _normalize_token_digits(token: str) -> str:
-    """
-    يطبع الأرقام العربية إلى إنجليزية، ويحوّل الفاصل العشري العربي (٫) إلى نقطة،
-    وفاصل الآلاف العربي (٬) إلى لا شيء.
-    """
-    s = token.translate(_ARABIC_DIGITS)
-    s = s.replace("٫", ".").replace("٬", "")
-    return s
-
-def _to_decimal(num_str: str) -> Decimal:
-    s = _normalize_token_digits(num_str).strip()
-    if "," in s and "." in s:
-        last_comma = s.rfind(",")
-        last_dot = s.rfind(".")
-        if last_comma > last_dot:
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    else:
-        if "," in s and "." not in s:
-            s = s.replace(",", ".")
-    return Decimal(s)
-
-def extract_numbers_with_spans(text: str) -> List[Tuple[str, Tuple[int, int]]]:
-    return [(m.group(0), m.span()) for m in NUM_REGEX.finditer(text)]
-
-def _is_protected_number(token: str, neighbor: str) -> bool:
-    """محمي إذا كان كسريًا أو بجوار سياق مالي (جنيه/دولار/شراء/بيع/%)."""
-    token_norm = _normalize_token_digits(token)
-    has_decimal = bool(re.search(r'[.,]\d+', token_norm))
-    if has_decimal:
-        return True
-    neighbor_norm = _normalize_token_digits(neighbor).replace("ـ", "")
-    return any(hint in neighbor_norm for hint in CURRENCY_HINTS)
-
-def extract_protected_decimals(text: str) -> List[Decimal]:
-    """تلتقط فقط الأرقام الحساسة (أسعار/نِسَب)."""
-    vals: List[Decimal] = []
-    for token, (start, end) in extract_numbers_with_spans(text):
-        neighbor = text[max(0, start-15):min(len(text), end+15)]
-        if not _is_protected_number(token, neighbor):
-            continue
-        try:
-            vals.append(_to_decimal(token))
-        except InvalidOperation:
-            continue
-    return vals
-
-def multiset_contains(small: List[Decimal], big: List[Decimal]) -> bool:
-    """يتحقق أن جميع أرقام المصدر المحمية موجودة في المخرَج (يسمح بالزيادة)."""
-    from collections import Counter
-    cs, cb = Counter(small), Counter(big)
-    for k, v in cs.items():
-        if cb.get(k, 0) < v:
-            return False
-    return True
-
-def normalize_decimal_token(token: str) -> str:
-    """يوحّد الأرقام العشرية إلى نقطتين عشريتين؛ الصحيحة تُترك كما هي."""
-    token_norm = _normalize_token_digits(token)
-    has_decimal = bool(re.search(r'[.,]\d+', token_norm))
-    if not has_decimal:
-        return token  # لا نغيّر عرض الأعداد الصحيحة (لتواريخ الخ)
-    try:
-        dec = _to_decimal(token_norm)
-    except InvalidOperation:
-        return token
-    return f"{dec:.2f}"
-
-def unify_decimal_points(text: str) -> str:
-    out = []
-    last_idx = 0
-    for token, (start, end) in extract_numbers_with_spans(text):
-        out.append(text[last_idx:start])
-        out.append(normalize_decimal_token(token))
-        last_idx = end
-    out.append(text[last_idx:])
-    return "".join(out)
-
-# ----------------- استدعاء OpenAI -----------------
-
 def rewrite_with_openai(raw_text: str, api_key: str, base_url: str, model: str,
                         temperature: float = 0.3, max_output_tokens: int = 2000) -> str:
+    """استدعاء OpenAI لإعادة الصياغة فقط."""
     client = OpenAI(api_key=api_key, base_url=base_url)
     user_prompt = USER_PROMPT_TEMPLATE.format(original_text=raw_text)
+
     params = dict(
         model=model,
         instructions=SYSTEM_PROMPT,
         input=[{"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
         max_output_tokens=max_output_tokens,
     )
+
     def _call(p):
         return client.responses.create(**p).output_text.strip()
+
     last_err = None
     for attempt in range(4):
         try:
             if attempt == 0:
-                p = dict(params); p["temperature"] = float(temperature)
+                p = dict(params)
+                p["temperature"] = float(temperature)
                 return _call(p)
             else:
                 return _call(params)
-        except (RateLimitError, APITimeoutError) as e:
-            last_err = e; continue
+        except (RateLimitError, APITimeoutError):
+            continue
         except APIError as e:
-            last_err = e
             msg = str(e)
             if "temperature" in msg or "Unsupported parameter" in msg:
-                try:
-                    return _call(params)
-                except Exception as ee:
-                    last_err = ee; continue
+                return _call(params)
+            last_err = e
             continue
     raise RuntimeError(f"OpenAI call failed: {last_err}")
-
-# ----------------- المعالجة الرئيسية -----------------
 
 def process_article(raw_text: str, api_key: str, base_url: str,
                     model: str = "gpt-5-mini",
                     temperature: float = 0.3,
                     max_output_tokens: int = 2000):
-    """يشغّل التسلسل الكامل: استخراج → إعادة صياغة → توحيد → تحقق رقمي."""
-    original_protected = extract_protected_decimals(raw_text)
-    rewritten = rewrite_with_openai(raw_text, api_key, base_url, model,
-                                    temperature=temperature,
-                                    max_output_tokens=max_output_tokens)
-    rewritten_unified = unify_decimal_points(rewritten)
-    rewritten_protected = extract_protected_decimals(rewritten_unified)
-
-    if not multiset_contains(original_protected, rewritten_protected):
-        from collections import Counter
-        want = Counter(original_protected)
-        got  = Counter(rewritten_protected)
-        missing = []
-        for k, v in want.items():
-            if got.get(k, 0) < v:
-                missing.append((str(k), v, got.get(k, 0)))
-        info = {
-            "status": "fail",
-            "message": "فشل التحقق الرقمي: بعض القيم الحساسة من المصدر غير موجودة في المخرَج أو ناقصة.",
-            "missing": missing,
-            "original_protected": [str(x) for x in original_protected],
-            "rewritten_protected": [str(x) for x in rewritten_protected],
-        }
-        return None, info
-
-    return rewritten_unified, {"status": "ok"}
+    """يُعيد النص فقط دون أي تحقق."""
+    rewritten = rewrite_with_openai(
+        raw_text, api_key, base_url, model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens
+    )
+    return rewritten, {"status": "ok"}
