@@ -72,8 +72,19 @@ USER_PROMPT_TEMPLATE = """هذا هو النص الأصلي الذي أريد إ
 
 # ----------------- أدوات الأرقام -----------------
 
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+def _normalize_token_digits(token: str) -> str:
+    """
+    يطبع الأرقام العربية إلى إنجليزية، ويحوّل الفاصل العشري العربي (٫) إلى نقطة،
+    وفاصل الآلاف العربي (٬) إلى لا شيء.
+    """
+    s = token.translate(_ARABIC_DIGITS)
+    s = s.replace("٫", ".").replace("٬", "")
+    return s
+
 def _to_decimal(num_str: str) -> Decimal:
-    s = num_str.strip()
+    s = _normalize_token_digits(num_str).strip()
     if "," in s and "." in s:
         last_comma = s.rfind(",")
         last_dot = s.rfind(".")
@@ -91,15 +102,16 @@ def extract_numbers_with_spans(text: str) -> List[Tuple[str, Tuple[int, int]]]:
     return [(m.group(0), m.span()) for m in NUM_REGEX.finditer(text)]
 
 def _is_protected_number(token: str, neighbor: str) -> bool:
-    """نعتبر الرقم محميًا إذا كان كسريًا أو بجوار كلمات مالية (جنيه، دولار، شراء...)."""
-    has_decimal = bool(re.search(r'[.,]\d+', token))
+    """محمي إذا كان كسريًا أو بجوار سياق مالي (جنيه/دولار/شراء/بيع/%)."""
+    token_norm = _normalize_token_digits(token)
+    has_decimal = bool(re.search(r'[.,]\d+', token_norm))
     if has_decimal:
         return True
-    neighbor_norm = neighbor.replace("ـ", "")
+    neighbor_norm = _normalize_token_digits(neighbor).replace("ـ", "")
     return any(hint in neighbor_norm for hint in CURRENCY_HINTS)
 
 def extract_protected_decimals(text: str) -> List[Decimal]:
-    """تُرجع فقط الأرقام الحساسة (أسعار/نِسَب)."""
+    """تلتقط فقط الأرقام الحساسة (أسعار/نِسَب)."""
     vals: List[Decimal] = []
     for token, (start, end) in extract_numbers_with_spans(text):
         neighbor = text[max(0, start-15):min(len(text), end+15)]
@@ -112,7 +124,7 @@ def extract_protected_decimals(text: str) -> List[Decimal]:
     return vals
 
 def multiset_contains(small: List[Decimal], big: List[Decimal]) -> bool:
-    """يتحقق أن جميع أرقام المصدر المحمية موجودة في المخرَج."""
+    """يتحقق أن جميع أرقام المصدر المحمية موجودة في المخرَج (يسمح بالزيادة)."""
     from collections import Counter
     cs, cb = Counter(small), Counter(big)
     for k, v in cs.items():
@@ -122,11 +134,12 @@ def multiset_contains(small: List[Decimal], big: List[Decimal]) -> bool:
 
 def normalize_decimal_token(token: str) -> str:
     """يوحّد الأرقام العشرية إلى نقطتين عشريتين؛ الصحيحة تُترك كما هي."""
-    has_decimal = bool(re.search(r'[.,]\d+', token))
+    token_norm = _normalize_token_digits(token)
+    has_decimal = bool(re.search(r'[.,]\d+', token_norm))
     if not has_decimal:
-        return token
+        return token  # لا نغيّر عرض الأعداد الصحيحة (لتواريخ الخ)
     try:
-        dec = _to_decimal(token)
+        dec = _to_decimal(token_norm)
     except InvalidOperation:
         return token
     return f"{dec:.2f}"
@@ -153,22 +166,18 @@ def rewrite_with_openai(raw_text: str, api_key: str, base_url: str, model: str,
         input=[{"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
         max_output_tokens=max_output_tokens,
     )
-
     def _call(p):
         return client.responses.create(**p).output_text.strip()
-
     last_err = None
     for attempt in range(4):
         try:
             if attempt == 0:
-                p = dict(params)
-                p["temperature"] = float(temperature)
+                p = dict(params); p["temperature"] = float(temperature)
                 return _call(p)
             else:
                 return _call(params)
         except (RateLimitError, APITimeoutError) as e:
-            last_err = e
-            continue
+            last_err = e; continue
         except APIError as e:
             last_err = e
             msg = str(e)
@@ -176,8 +185,7 @@ def rewrite_with_openai(raw_text: str, api_key: str, base_url: str, model: str,
                 try:
                     return _call(params)
                 except Exception as ee:
-                    last_err = ee
-                    continue
+                    last_err = ee; continue
             continue
     raise RuntimeError(f"OpenAI call failed: {last_err}")
 
@@ -198,15 +206,14 @@ def process_article(raw_text: str, api_key: str, base_url: str,
     if not multiset_contains(original_protected, rewritten_protected):
         from collections import Counter
         want = Counter(original_protected)
-        got = Counter(rewritten_protected)
+        got  = Counter(rewritten_protected)
         missing = []
         for k, v in want.items():
             if got.get(k, 0) < v:
                 missing.append((str(k), v, got.get(k, 0)))
-        msg = "فشل التحقق الرقمي: بعض القيم الحساسة من المصدر غير موجودة في المخرَج أو ناقصة."
         info = {
             "status": "fail",
-            "message": msg,
+            "message": "فشل التحقق الرقمي: بعض القيم الحساسة من المصدر غير موجودة في المخرَج أو ناقصة.",
             "missing": missing,
             "original_protected": [str(x) for x in original_protected],
             "rewritten_protected": [str(x) for x in rewritten_protected],
