@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
+"""
+نواة المنطق: قفل الأرقام + توحيد العلامة العشرية + استدعاء OpenAI
+- Fallback تلقائي إذا كانت temperature غير مدعومة.
+"""
+
 import re
 from decimal import Decimal, InvalidOperation
 from typing import List, Tuple
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 
+# يلتقط الأرقام مع أو بدون كسور، ومع احتمالات فواصل آلاف
 NUM_REGEX = re.compile(
     r'(?<![\w.\-])(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?(?![\w.\-])',
     re.UNICODE
@@ -56,7 +62,10 @@ USER_PROMPT_TEMPLATE = """هذا هو النص الأصلي الذي أريد إ
 {original_text}
 """
 
+# ----------------- أدوات الأرقام -----------------
+
 def _to_decimal(num_str: str) -> Decimal:
+    """تطبيع سلسلة رقمية إلى Decimal (يتعامل مع الفواصل المختلفة)."""
     s = num_str.strip()
     if "," in s and "." in s:
         last_comma = s.rfind(",")
@@ -71,7 +80,7 @@ def _to_decimal(num_str: str) -> Decimal:
             s = s.replace(",", ".")
     return Decimal(s)
 
-def extract_numbers_with_spans(text: str):
+def extract_numbers_with_spans(text: str) -> List[Tuple[str, Tuple[int, int]]]:
     return [(m.group(0), m.span()) for m in NUM_REGEX.finditer(text)]
 
 def extract_decimal_list(text: str) -> List[Decimal]:
@@ -88,6 +97,7 @@ def numbers_multiset_equal(a: List[Decimal], b: List[Decimal]) -> bool:
     return Counter(a) == Counter(b)
 
 def normalize_decimal_token(token: str) -> str:
+    """إن كان الرقم كسريًا → نقطتان عشريتان. الصحيح يُترك كما هو."""
     has_decimal = bool(re.search(r'[.,]\d+', token))
     if not has_decimal:
         return token
@@ -107,31 +117,62 @@ def unify_decimal_points(text: str) -> str:
     out.append(text[last_idx:])
     return "".join(out)
 
-def rewrite_with_openai(raw_text: str, api_key: str, base_url: str, model: str, temperature: float = 0.3, max_output_tokens: int = 2000) -> str:
+# ----------------- استدعاء OpenAI -----------------
+
+def rewrite_with_openai(raw_text: str, api_key: str, base_url: str, model: str,
+                        temperature: float = 0.3, max_output_tokens: int = 2000) -> str:
+    """محاولة مع temperature، وإن رُفضت نعيد الطلب بدونها تلقائيًا."""
     client = OpenAI(api_key=api_key, base_url=base_url)
     user_prompt = USER_PROMPT_TEMPLATE.format(original_text=raw_text)
 
+    params = dict(
+        model=model,
+        instructions=SYSTEM_PROMPT,
+        input=[{"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
+        max_output_tokens=max_output_tokens,
+    )
+
+    def _call(p):
+        return client.responses.create(**p).output_text.strip()
+
     last_err = None
-    for _ in range(4):
+    for attempt in range(4):
         try:
-            resp = client.responses.create(
-                model=model,
-                instructions=SYSTEM_PROMPT,
-                input=[{"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-            )
-            return resp.output_text.strip()
-        except (RateLimitError, APITimeoutError, APIError) as e:
+            if attempt == 0:
+                p = dict(params)
+                p["temperature"] = float(temperature)
+                return _call(p)
+            else:
+                return _call(params)  # بدون temperature
+        except (RateLimitError, APITimeoutError) as e:
             last_err = e
+            continue
+        except APIError as e:
+            last_err = e
+            # إذا ظهر عدم دعم temperature → جرّب فورًا بدونها
+            msg = str(e)
+            if "temperature" in msg or "Unsupported parameter" in msg:
+                try:
+                    return _call(params)
+                except Exception as ee:
+                    last_err = ee
+                    continue
+            continue
     raise RuntimeError(f"OpenAI call failed: {last_err}")
 
-def process_article(raw_text: str, api_key: str, base_url: str, model: str = "gpt-5-mini"):
+# ----------------- الدالة الرئيسية للوحدة -----------------
+
+def process_article(raw_text: str, api_key: str, base_url: str,
+                    model: str = "gpt-5-mini",
+                    temperature: float = 0.3,
+                    max_output_tokens: int = 2000):
     # 1) أرقام المصدر
     original_decimals = extract_decimal_list(raw_text)
     # 2) استدعاء النموذج
-    rewritten = rewrite_with_openai(raw_text, api_key, base_url, model)
-    # 3) توحيد العلامة العشرية (لأرقام ذات كسور)
+    rewritten = rewrite_with_openai(raw_text, api_key, base_url, model,
+                                    temperature=temperature,
+                                    max_output_tokens=max_output_tokens)
+    # 3) توحيد العلامة العشرية للأرقام ذات الكسور
     rewritten_unified = unify_decimal_points(rewritten)
     # 4) تحقق القيم العددية
     rewritten_decimals = extract_decimal_list(rewritten_unified)
