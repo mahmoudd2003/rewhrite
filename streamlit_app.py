@@ -4,7 +4,7 @@ from rewrite_core import process_article
 
 st.set_page_config(page_title="Arabic SEO Rewriter", page_icon="📰", layout="centered")
 st.title("📰 Arabic SEO Rewriter")
-st.caption("إعادة صياغة بأسلوب مبسّط للجمهور العام مع قفل الأرقام وتوحيد العلامة العشرية – نص فقط جاهز للسيو.")
+st.caption("إعادة صياغة بأسلوب مبسّط للجمهور العام مع قفل الأرقام الحسّاسة وتوحيد العلامة العشرية – نص فقط جاهز للسيو.")
 
 st.markdown("**الخطوة 1:** أدخل المقال الأصلي (لصقًا أو رفع ملف).")
 input_mode = st.radio("طريقة الإدخال", ["لصق النص", "رفع ملف"], horizontal=True)
@@ -55,10 +55,11 @@ if st.button("▶️ إعادة الصياغة الآن", type="primary"):
         if info["status"] != "ok":
             st.error(info["message"])
             with st.expander("تفاصيل التحقق"):
-                st.write("Original numbers:", info.get("original_numbers", []))
-                st.write("Rewritten numbers:", info.get("rewritten_numbers", []))
+                st.write("Missing (value, needed, got):", info.get("missing", []))
+                st.write("Original protected numbers:", info.get("original_protected", []))
+                st.write("Rewritten protected numbers:", info.get("rewritten_protected", []))
         else:
-            st.success("تمت إعادة الصياغة بنجاح (الأرقام مطابقة للمصدر).")
+            st.success("تمت إعادة الصياغة بنجاح (الأرقام الحسّاسة مطابقة للمصدر).")
             st.markdown("### ✅ النص النهائي (SEO-ready)")
             st.write(output)
             st.download_button(
